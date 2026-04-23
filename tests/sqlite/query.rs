@@ -16,6 +16,19 @@ fn select_1() {
 }
 
 #[test]
+fn select_1_with_schema() {
+    assert_eq!(
+        Query::select()
+            .columns([Char::Character, Char::SizeW, Char::SizeH])
+            .from(("schema", Char::Table))
+            .limit(10)
+            .offset(100)
+            .to_string(SqliteQueryBuilder),
+        r#"SELECT "character", "size_w", "size_h" FROM "schema"."character" LIMIT 10 OFFSET 100"#
+    );
+}
+
+#[test]
 fn select_2() {
     assert_eq!(
         Query::select()
@@ -107,6 +120,21 @@ fn select_8() {
             )
             .to_string(SqliteQueryBuilder),
         r#"SELECT "character" FROM "character" LEFT JOIN "font" ON "character"."font_id" = "font"."id""#
+    );
+}
+
+#[test]
+fn select_cross_schema_join() {
+    assert_eq!(
+        Query::select()
+            .columns([Char::Character])
+            .from(("schema1", Char::Table))
+            .left_join(
+                ("schema2", Font::Table),
+                Expr::col((Char::Table, Char::FontId)).equals((Font::Table, Font::Id)),
+            )
+            .to_string(SqliteQueryBuilder),
+        r#"SELECT "character" FROM "schema1"."character" LEFT JOIN "schema2"."font" ON "character"."font_id" = "font"."id""#
     );
 }
 
@@ -444,6 +472,15 @@ fn select_32() {
     assert_eq!(
         Query::select()
             .expr_as(Expr::col(Char::Character), "C")
+            .from(Char::Table)
+            .to_string(SqliteQueryBuilder),
+        r#"SELECT "character" AS "C" FROM "character""#
+    );
+
+    // Same SQL as `expr_as`, but expressed via `SelectExprTrait`.
+    assert_eq!(
+        Query::select()
+            .expr(Expr::col(Char::Character).alias("C"))
             .from(Char::Table)
             .to_string(SqliteQueryBuilder),
         r#"SELECT "character" AS "C" FROM "character""#
@@ -988,6 +1025,34 @@ fn select_58() {
 }
 
 #[test]
+fn select_59() {
+    assert_eq!(
+        Query::select()
+            .from(Char::Table)
+            .expr(
+                Expr::col(Char::Character)
+                    .max()
+                    .over(WindowStatement::partition_by(Char::FontSize))
+                    .alias("C"),
+            )
+            .to_string(SqliteQueryBuilder),
+        r#"SELECT MAX("character") OVER ( PARTITION BY "font_size" ) AS "C" FROM "character""#
+    );
+}
+
+#[test]
+fn select_60() {
+    assert_eq!(
+        Query::select()
+            .from(Char::Table)
+            .expr(Expr::col(Char::Character).max().over("w"))
+            .window("w", WindowStatement::partition_by(Char::FontSize))
+            .to_string(SqliteQueryBuilder),
+        r#"SELECT MAX("character") OVER "w" FROM "character" WINDOW "w" AS (PARTITION BY "font_size")"#
+    );
+}
+
+#[test]
 fn glob_bin_oper() {
     assert_eq!(
         Query::select()
@@ -1091,7 +1156,9 @@ fn insert_4() {
         Query::insert()
             .into_table(Glyph::Table)
             .columns([Glyph::Image])
-            .values_panic([chrono::NaiveDateTime::from_timestamp_opt(0, 0)
+            .values_panic([chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
                 .unwrap()
                 .into()])
             .to_string(SqliteQueryBuilder),

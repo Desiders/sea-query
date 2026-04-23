@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 
-use crate::{ColumnType, CommonSqlQueryBuilder, QueryBuilder, StringLen};
+use crate::{ColumnType, CommonSqlQueryBuilder, QueryBuilder, RcOrArc, StringLen};
 
 #[cfg(test)]
 mod tests;
@@ -66,11 +66,15 @@ mod with_mac_address;
 
 #[cfg(feature = "postgres-array")]
 #[cfg_attr(docsrs, doc(cfg(feature = "postgres-array")))]
-pub mod with_array;
+pub mod postgres_array;
 
 #[cfg(feature = "postgres-vector")]
 #[cfg_attr(docsrs, doc(cfg(feature = "postgres-vector")))]
-mod with_pgvector;
+mod postgres_vector;
+
+#[cfg(feature = "postgres-range")]
+#[cfg_attr(docsrs, doc(cfg(feature = "postgres-range")))]
+mod postgres_range;
 
 #[cfg(all(test, feature = "serde", feature = "with-json"))]
 mod serde_tests;
@@ -91,6 +95,10 @@ pub enum ArrayType {
     Float,
     Double,
     String,
+    // box it because value size limit
+    #[cfg(feature = "backend-postgres")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "backend-postgres")))]
+    Enum(Box<EnumTypeName>),
     Char,
     Bytes,
 
@@ -177,6 +185,29 @@ pub enum ArrayType {
     #[cfg(feature = "with-mac_address")]
     #[cfg_attr(docsrs, doc(cfg(feature = "with-mac_address")))]
     MacAddress,
+
+    #[cfg(feature = "postgres-range")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "postgres-range")))]
+    Range,
+}
+
+// TODO: Arc<str> or Arc<String>?
+pub type EnumTypeName = RcOrArc<str>;
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Enum {
+    pub type_name: EnumTypeName,
+    pub value: Cow<'static, str>,
+}
+
+// I’m not sure we really need this abstraction, but array_type method requires the enum name so I added this type to avoid runtime panics.
+// Once array_type no longer needs it, we can remove it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum OptionEnum {
+    Some(Box<Enum>),
+    None(EnumTypeName),
 }
 
 /// Value variants
@@ -201,6 +232,7 @@ pub enum Value {
     Float(Option<f32>),
     Double(Option<f64>),
     String(Option<String>),
+    Enum(OptionEnum),
     Char(Option<char>),
 
     #[allow(clippy::box_collection)]
@@ -366,6 +398,10 @@ impl Value {
             Self::Float(_) => Self::Float(None),
             Self::Double(_) => Self::Double(None),
             Self::String(_) => Self::String(None),
+            Self::Enum(OptionEnum::Some(v)) => Self::Enum(OptionEnum::None(v.type_name.clone())),
+            Self::Enum(OptionEnum::None(type_name)) => {
+                Self::Enum(OptionEnum::None(type_name.clone()))
+            }
             Self::Char(_) => Self::Char(None),
             Self::Bytes(_) => Self::Bytes(None),
 
@@ -490,6 +526,16 @@ impl Value {
             Self::Float(_) => Self::Float(Some(Default::default())),
             Self::Double(_) => Self::Double(Some(Default::default())),
             Self::String(_) => Self::String(Some(Default::default())),
+            Self::Enum(v) => {
+                let type_name = match v {
+                    OptionEnum::Some(v) => v.type_name.clone(),
+                    OptionEnum::None(type_name) => type_name.clone(),
+                };
+                Self::Enum(OptionEnum::Some(Box::new(Enum {
+                    type_name,
+                    value: Cow::Borrowed(""),
+                })))
+            }
             Self::Char(_) => Self::Char(Some(Default::default())),
             Self::Bytes(_) => Self::Bytes(Some(Default::default())),
 
@@ -600,6 +646,141 @@ impl Value {
             Self::Range(_) => Self::Range(Some(Default::default())),
         }
     }
+
+    pub fn array_type(&self) -> ArrayType {
+        #[allow(unused_imports)]
+        use std::ops::Deref;
+
+        fn array_type_of<V: ValueType>(_: &Option<V>) -> ArrayType {
+            V::array_type()
+        }
+
+        #[allow(dead_code)]
+        fn array_type_of_ref<V: ValueType>(_: Option<&V>) -> ArrayType {
+            V::array_type()
+        }
+
+        match self {
+            Self::Bool(v) => array_type_of(v),
+            Self::TinyInt(v) => array_type_of(v),
+            Self::SmallInt(v) => array_type_of(v),
+            Self::Int(v) => array_type_of(v),
+            Self::BigInt(v) => array_type_of(v),
+            Self::TinyUnsigned(v) => array_type_of(v),
+            Self::SmallUnsigned(v) => array_type_of(v),
+            Self::Unsigned(v) => array_type_of(v),
+            Self::BigUnsigned(v) => array_type_of(v),
+            Self::Float(v) => array_type_of(v),
+            Self::Double(v) => array_type_of(v),
+            Self::String(v) => array_type_of(v),
+
+            #[cfg(feature = "backend-postgres")]
+            Self::Enum(v) => ArrayType::Enum(Box::new(match v {
+                OptionEnum::Some(v) => v.type_name.clone(),
+                OptionEnum::None(type_name) => type_name.clone(),
+            })),
+            #[cfg(not(feature = "backend-postgres"))]
+            Self::Enum(_) => ArrayType::String,
+            Self::Char(v) => array_type_of(v),
+            Self::Bytes(v) => array_type_of(v),
+
+            #[cfg(feature = "with-json")]
+            #[cfg_attr(docsrs, doc(cfg(feature = "with-json")))]
+            Self::Json(v) => array_type_of_ref(v.as_ref().map(|v| v.deref())),
+
+            #[cfg(feature = "with-chrono")]
+            #[cfg_attr(docsrs, doc(cfg(feature = "with-chrono")))]
+            Self::ChronoDate(v) => array_type_of(v),
+
+            #[cfg(feature = "with-chrono")]
+            #[cfg_attr(docsrs, doc(cfg(feature = "with-chrono")))]
+            Self::ChronoTime(v) => array_type_of(v),
+
+            #[cfg(feature = "with-chrono")]
+            #[cfg_attr(docsrs, doc(cfg(feature = "with-chrono")))]
+            Self::ChronoDateTime(v) => array_type_of(v),
+
+            #[cfg(feature = "with-chrono")]
+            #[cfg_attr(docsrs, doc(cfg(feature = "with-chrono")))]
+            Self::ChronoDateTimeUtc(v) => array_type_of(v),
+
+            #[cfg(feature = "with-chrono")]
+            #[cfg_attr(docsrs, doc(cfg(feature = "with-chrono")))]
+            Self::ChronoDateTimeLocal(v) => array_type_of(v),
+
+            #[cfg(feature = "with-chrono")]
+            #[cfg_attr(docsrs, doc(cfg(feature = "with-chrono")))]
+            Self::ChronoDateTimeWithTimeZone(v) => array_type_of(v),
+
+            #[cfg(feature = "with-time")]
+            #[cfg_attr(docsrs, doc(cfg(feature = "with-time")))]
+            Self::TimeDate(v) => array_type_of(v),
+
+            #[cfg(feature = "with-time")]
+            #[cfg_attr(docsrs, doc(cfg(feature = "with-time")))]
+            Self::TimeTime(v) => array_type_of(v),
+
+            #[cfg(feature = "with-time")]
+            #[cfg_attr(docsrs, doc(cfg(feature = "with-time")))]
+            Self::TimeDateTime(v) => array_type_of(v),
+
+            #[cfg(feature = "with-time")]
+            #[cfg_attr(docsrs, doc(cfg(feature = "with-time")))]
+            Self::TimeDateTimeWithTimeZone(v) => array_type_of(v),
+
+            #[cfg(feature = "with-jiff")]
+            #[cfg_attr(docsrs, doc(cfg(feature = "with-jiff")))]
+            Self::JiffDate(v) => array_type_of(v),
+
+            #[cfg(feature = "with-jiff")]
+            #[cfg_attr(docsrs, doc(cfg(feature = "with-jiff")))]
+            Self::JiffTime(v) => array_type_of(v),
+
+            #[cfg(feature = "with-jiff")]
+            #[cfg_attr(docsrs, doc(cfg(feature = "with-jiff")))]
+            Self::JiffDateTime(v) => array_type_of_ref(v.as_ref().map(|v| v.deref())),
+
+            #[cfg(feature = "with-jiff")]
+            #[cfg_attr(docsrs, doc(cfg(feature = "with-jiff")))]
+            Self::JiffTimestamp(v) => array_type_of_ref(v.as_ref().map(|v| v.deref())),
+
+            #[cfg(feature = "with-jiff")]
+            #[cfg_attr(docsrs, doc(cfg(feature = "with-jiff")))]
+            Self::JiffZoned(v) => array_type_of_ref(v.as_ref().map(|v| v.deref())),
+
+            #[cfg(feature = "with-uuid")]
+            #[cfg_attr(docsrs, doc(cfg(feature = "with-uuid")))]
+            Self::Uuid(v) => array_type_of(v),
+
+            #[cfg(feature = "with-rust_decimal")]
+            #[cfg_attr(docsrs, doc(cfg(feature = "with-rust_decimal")))]
+            Self::Decimal(v) => array_type_of(v),
+
+            #[cfg(feature = "with-bigdecimal")]
+            #[cfg_attr(docsrs, doc(cfg(feature = "with-bigdecimal")))]
+            Self::BigDecimal(v) => array_type_of_ref(v.as_ref().map(|v| v.deref())),
+
+            #[cfg(feature = "postgres-array")]
+            #[cfg_attr(docsrs, doc(cfg(feature = "postgres-array")))]
+            Self::Array(v, _) => v.clone(),
+
+            #[cfg(feature = "postgres-vector")]
+            #[cfg_attr(docsrs, doc(cfg(feature = "postgres-vector")))]
+            Self::Vector(v) => array_type_of(v),
+
+            #[cfg(feature = "with-ipnetwork")]
+            #[cfg_attr(docsrs, doc(cfg(feature = "with-ipnetwork")))]
+            Self::IpNetwork(v) => array_type_of(v),
+
+            #[cfg(feature = "with-mac_address")]
+            #[cfg_attr(docsrs, doc(cfg(feature = "with-mac_address")))]
+            Self::MacAddress(v) => array_type_of(v),
+
+            #[cfg(feature = "postgres-range")]
+            #[cfg_attr(docsrs, doc(cfg(feature = "postgres-range")))]
+            Self::Range(v) => array_type_of_ref(v.as_ref().map(|v| v.deref())),
+        }
+    }
 }
 
 impl From<&[u8]> for Value {
@@ -635,6 +816,12 @@ where
 impl From<Cow<'_, str>> for Value {
     fn from(x: Cow<'_, str>) -> Value {
         x.into_owned().into()
+    }
+}
+
+impl From<Enum> for Value {
+    fn from(value: Enum) -> Value {
+        Value::Enum(OptionEnum::Some(Box::new(value)))
     }
 }
 
@@ -759,6 +946,35 @@ impl Nullable for &str {
     }
 }
 
+impl Nullable for Enum {
+    fn null() -> Value {
+        Value::Enum(OptionEnum::None("".into()))
+    }
+}
+
+impl ValueType for Enum {
+    fn try_from(v: Value) -> Result<Self, ValueTypeErr> {
+        match v {
+            Value::Enum(OptionEnum::Some(v)) => Ok(*v),
+            _ => Err(ValueTypeErr),
+        }
+    }
+
+    fn type_name() -> String {
+        "Enum".into()
+    }
+
+    // These implementations probably won’t actually be used, so there
+    // shouldn’t cause any runtime issues.
+    fn array_type() -> ArrayType {
+        ArrayType::String
+    }
+
+    fn column_type() -> ColumnType {
+        ColumnType::String(StringLen::None)
+    }
+}
+
 macro_rules! type_to_value {
     ( $type: ty, $name: ident, $col_type: expr ) => {
         impl From<$type> for Value {
@@ -796,6 +1012,8 @@ macro_rules! type_to_value {
         }
     };
 }
+
+#[allow(unused_imports)]
 use type_to_value;
 
 type_to_value!(bool, Bool, Boolean);

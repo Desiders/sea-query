@@ -447,6 +447,15 @@ fn select_32() {
             .to_string(MysqlQueryBuilder),
         "SELECT `character` AS `C` FROM `character`"
     );
+
+    // Same SQL as `expr_as`, but expressed via `SelectExprTrait`.
+    assert_eq!(
+        Query::select()
+            .expr(Expr::col(Char::Character).alias("C"))
+            .from(Char::Table)
+            .to_string(MysqlQueryBuilder),
+        "SELECT `character` AS `C` FROM `character`"
+    );
 }
 
 #[test]
@@ -1043,6 +1052,34 @@ fn select_61() {
 }
 
 #[test]
+fn select_62() {
+    assert_eq!(
+        Query::select()
+            .from(Char::Table)
+            .expr(
+                Expr::col(Char::Character)
+                    .max()
+                    .over(WindowStatement::partition_by(Char::FontSize))
+                    .alias("C"),
+            )
+            .to_string(MysqlQueryBuilder),
+        r#"SELECT MAX(`character`) OVER ( PARTITION BY `font_size` ) AS `C` FROM `character`"#
+    );
+}
+
+#[test]
+fn select_63() {
+    assert_eq!(
+        Query::select()
+            .from(Char::Table)
+            .expr(Expr::col(Char::Character).max().over("w"))
+            .window("w", WindowStatement::partition_by(Char::FontSize))
+            .to_string(MysqlQueryBuilder),
+        r#"SELECT MAX(`character`) OVER `w` FROM `character` WINDOW `w` AS (PARTITION BY `font_size`)"#
+    );
+}
+
+#[test]
 fn md5_fn() {
     assert_eq!(
         Query::select()
@@ -1092,7 +1129,9 @@ fn insert_4() {
         Query::insert()
             .into_table(Glyph::Table)
             .columns([Glyph::Image])
-            .values_panic([chrono::NaiveDateTime::from_timestamp_opt(0, 0)
+            .values_panic([chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
                 .unwrap()
                 .into()])
             .to_string(MysqlQueryBuilder),

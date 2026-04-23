@@ -1,6 +1,7 @@
 use sea_query::{extension::mysql::*, tests_cfg::*, *};
 
 mod constraint;
+mod explain;
 mod foreign_key;
 mod index;
 mod query;

@@ -1,3 +1,5 @@
+use core::f64;
+
 use super::*;
 use pretty_assertions::assert_eq;
 use sea_query::{audit::AuditTrait, extension::postgres::PgBinOper};
@@ -498,6 +500,15 @@ fn select_32() {
     assert_eq!(
         query.audit_unwrap().selected_tables(),
         [Char::Table.into_iden()]
+    );
+
+    // Same SQL as `expr_as`, but expressed via `SelectExprTrait`.
+    assert_eq!(
+        Query::select()
+            .expr(Expr::col(Char::Character).alias("C"))
+            .from(Char::Table)
+            .to_string(PostgresQueryBuilder),
+        r#"SELECT "character" AS "C" FROM "character""#
     );
 }
 
@@ -1276,6 +1287,34 @@ fn select_65() {
 }
 
 #[test]
+fn select_66() {
+    assert_eq!(
+        Query::select()
+            .from(Char::Table)
+            .expr(
+                Expr::col(Char::Character)
+                    .max()
+                    .over(WindowStatement::partition_by(Char::FontSize))
+                    .alias("C"),
+            )
+            .to_string(PostgresQueryBuilder),
+        r#"SELECT MAX("character") OVER ( PARTITION BY "font_size" ) AS "C" FROM "character""#
+    );
+}
+
+#[test]
+fn select_67() {
+    assert_eq!(
+        Query::select()
+            .from(Char::Table)
+            .expr(Expr::col(Char::Character).max().over("w"))
+            .window("w", WindowStatement::partition_by(Char::FontSize))
+            .to_string(PostgresQueryBuilder),
+        r#"SELECT MAX("character") OVER "w" FROM "character" WINDOW "w" AS (PARTITION BY "font_size")"#
+    );
+}
+
+#[test]
 #[allow(clippy::approx_constant)]
 fn insert_2() {
     let query = Query::insert()
@@ -1283,12 +1322,12 @@ fn insert_2() {
         .columns([Glyph::Image, Glyph::Aspect])
         .values_panic([
             "04108048005887010020060000204E0180400400".into(),
-            3.1415.into(),
+            f64::consts::PI.into(),
         ])
         .take();
     assert_eq!(
         query.to_string(PostgresQueryBuilder),
-        r#"INSERT INTO "glyph" ("image", "aspect") VALUES ('04108048005887010020060000204E0180400400', 3.1415)"#
+        r#"INSERT INTO "glyph" ("image", "aspect") VALUES ('04108048005887010020060000204E0180400400', 3.141592653589793)"#
     );
     assert_eq!(
         query.audit_unwrap().inserted_tables(),
@@ -1305,12 +1344,56 @@ fn insert_3() {
             .columns([Glyph::Image, Glyph::Aspect])
             .values_panic([
                 "04108048005887010020060000204E0180400400".into(),
-                3.1415.into(),
+                f64::consts::PI.into(),
             ])
             .values_panic([Value::String(None).into(), 2.1345.into()])
             .to_string(PostgresQueryBuilder),
-        r#"INSERT INTO "glyph" ("image", "aspect") VALUES ('04108048005887010020060000204E0180400400', 3.1415), (NULL, 2.1345)"#
+        r#"INSERT INTO "glyph" ("image", "aspect") VALUES ('04108048005887010020060000204E0180400400', 3.141592653589793), (NULL, 2.1345)"#
     );
+}
+
+#[test]
+fn insert_enum_literal_cast() {
+    let value = sea_query::Enum {
+        type_name: "FontSizeEnum".to_owned().into(),
+        value: "large".into(),
+    };
+
+    assert_eq!(
+        Query::insert()
+            .into_table(Char::Table)
+            .columns([Char::FontSize])
+            .values_panic([Expr::val(value)])
+            .to_string(PostgresQueryBuilder),
+        r#"INSERT INTO "character" ("font_size") VALUES ('large'::"FontSizeEnum")"#
+    );
+}
+
+#[test]
+#[cfg(feature = "postgres-array")]
+fn insert_enum_array_param_cast() {
+    let value = Value::Array(
+        ArrayType::Enum(Box::new("FontSizeEnum".to_owned().into())),
+        Some(Box::new(vec![
+            sea_query::Enum {
+                type_name: "FontSizeEnum".to_owned().into(),
+                value: "large".into(),
+            }
+            .into(),
+        ])),
+    );
+
+    let (statement, values) = Query::insert()
+        .into_table(Char::Table)
+        .columns([Char::FontSize])
+        .values_panic([Expr::val(value)])
+        .build(PostgresQueryBuilder);
+
+    assert_eq!(
+        statement,
+        r#"INSERT INTO "character" ("font_size") VALUES ($1::"FontSizeEnum"[])"#
+    );
+    assert_eq!(values, Values(vec![vec!["large".to_owned()].into()]));
 }
 
 #[test]
@@ -1320,7 +1403,9 @@ fn insert_4() {
         Query::insert()
             .into_table(Glyph::Table)
             .columns([Glyph::Image])
-            .values_panic([chrono::NaiveDateTime::from_timestamp_opt(0, 0)
+            .values_panic([chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
                 .unwrap()
                 .into()])
             .to_string(PostgresQueryBuilder),
@@ -1482,7 +1567,7 @@ fn insert_10() {
             .into_table(Glyph::Table)
             .columns([Glyph::Aspect, Glyph::Tokens])
             .values_panic([
-                3.1415.into(),
+                f64::consts::PI.into(),
                 vec![
                     "Token1".to_string(),
                     "Token2".to_string(),
@@ -1491,7 +1576,7 @@ fn insert_10() {
                 .into()
             ])
             .to_string(PostgresQueryBuilder),
-        r#"INSERT INTO "glyph" ("aspect", "tokens") VALUES (3.1415, ARRAY ['Token1','Token2','Token3'])"#
+        r#"INSERT INTO "glyph" ("aspect", "tokens") VALUES (3.141592653589793, ARRAY ['Token1','Token2','Token3'])"#
     );
 }
 
@@ -1503,9 +1588,9 @@ fn insert_issue_853() {
         Query::insert()
             .into_table(Glyph::Table)
             .columns([Glyph::Aspect, Glyph::Tokens])
-            .values_panic([3.1415.into(), Vec::<String>::new().into()])
+            .values_panic([f64::consts::PI.into(), Vec::<String>::new().into()])
             .to_string(PostgresQueryBuilder),
-        r#"INSERT INTO "glyph" ("aspect", "tokens") VALUES (3.1415, '{}')"#
+        r#"INSERT INTO "glyph" ("aspect", "tokens") VALUES (3.141592653589793, '{}')"#
     );
 }
 

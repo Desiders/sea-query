@@ -19,6 +19,11 @@ pub trait QueryBuilder:
 
     /// Translate [`InsertStatement`] into SQL statement.
     fn prepare_insert_statement(&self, insert: &InsertStatement, sql: &mut impl SqlWriter) {
+        self.prepare_insert_statement_common(insert, sql);
+    }
+
+    /// Common implementation of `prepare_insert_statement` shared among backends.
+    fn prepare_insert_statement_common(&self, insert: &InsertStatement, sql: &mut impl SqlWriter) {
         if let Some(with) = &insert.with {
             self.prepare_with_clause(with, sql);
         }
@@ -809,12 +814,21 @@ pub trait QueryBuilder:
         }
 
         sql.write_str(")").unwrap();
+
+        if let Some(filter) = &func.filter {
+            sql.write_str(" FILTER (WHERE ").unwrap();
+            self.prepare_condition_where(filter, sql);
+            sql.write_str(")").unwrap();
+        }
     }
 
     /// Translate [`QueryStatement`] into SQL statement.
     fn prepare_query_statement(&self, query: &SubQueryStatement, sql: &mut impl SqlWriter);
 
     fn prepare_select_into(&self, into_table: &SelectInto, sql: &mut impl SqlWriter);
+
+    /// Translate [`ExplainStatement`] into SQL statement.
+    fn prepare_explain_statement(&self, explain: &ExplainStatement, sql: &mut impl SqlWriter);
 
     fn prepare_with_query(&self, query: &WithQuery, sql: &mut impl SqlWriter) {
         self.prepare_with_clause(&query.with_clause, sql);
@@ -1254,6 +1268,10 @@ pub trait QueryBuilder:
             Value::Float(Some(v)) => write!(buf, "{v}")?,
             Value::Double(Some(v)) => write!(buf, "{v}")?,
             Value::String(Some(v)) => self.write_string_quoted(v, buf),
+            Value::Enum(v) => match v {
+                OptionEnum::Some(v) => self.write_string_quoted(v.value.as_ref(), buf),
+                OptionEnum::None(_) => buf.write_str("NULL")?,
+            },
             Value::Char(Some(v)) => {
                 self.write_string_quoted(std::str::from_utf8(&[*v as u8]).unwrap(), buf)
             }
@@ -1489,7 +1507,7 @@ pub trait QueryBuilder:
 
     #[doc(hidden)]
     fn prepare_on_conflict_target_constraint(&self, constraint: &str, sql: &mut impl SqlWriter) {
-        sql.write_fmt(format_args!("ON CONSTRAINT \"{}\"", constraint))
+        sql.write_fmt(format_args!("ON CONSTRAINT \"{constraint}\""))
             .unwrap();
     }
 
@@ -1897,6 +1915,14 @@ impl QueryBuilder for CommonSqlQueryBuilder {
 
     fn prepare_select_into(&self, _: &SelectInto, _: &mut impl SqlWriter) {}
 
+    fn prepare_explain_statement(&self, explain: &ExplainStatement, sql: &mut impl SqlWriter) {
+        sql.write_str("EXPLAIN").unwrap();
+        if let Some(statement) = &explain.statement {
+            sql.write_str(" ").unwrap();
+            statement.write_to(self, sql);
+        }
+    }
+
     fn prepare_value(&self, value: Value, sql: &mut impl SqlWriter) {
         sql.push_param(value, self as _);
     }
@@ -2069,5 +2095,19 @@ mod tests {
             assert_eq!(buf, expect);
             buf.clear();
         }
+    }
+
+    #[test]
+    #[cfg(feature = "postgres-array")]
+    fn prepare_array_null_and_empty() {
+        use crate::{ArrayType, PostgresQueryBuilder, QueryBuilder, Value};
+
+        let mut string = String::new();
+        PostgresQueryBuilder.prepare_value(Value::Array(ArrayType::String, None), &mut string);
+        assert_eq!(string, "NULL");
+
+        string.clear();
+        PostgresQueryBuilder.prepare_value(Vec::<String>::new().into(), &mut string);
+        assert_eq!(string, "'{}'");
     }
 }

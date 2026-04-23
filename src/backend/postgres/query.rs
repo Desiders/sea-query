@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(feature = "postgres-array")]
+use crate::ArrayType;
 use crate::extension::postgres::*;
 
 impl OperLeftAssocDecider for PostgresQueryBuilder {
@@ -57,6 +59,58 @@ impl QueryBuilder for PostgresQueryBuilder {
         }
     }
 
+    fn write_value(&self, buf: &mut impl Write, value: &Value) -> std::fmt::Result {
+        match value {
+            Value::Enum(v) => match v {
+                OptionEnum::Some(v) => {
+                    self.write_string_quoted(v.value.as_ref(), buf);
+                    self.write_enum_type_hint(v.type_name.as_ref(), buf);
+                    Ok(())
+                }
+                OptionEnum::None(_) => buf.write_str("NULL"),
+            },
+            #[cfg(feature = "postgres-array")]
+            Value::Array(ArrayType::Enum(type_name), values) => {
+                match values {
+                    None => return buf.write_str("NULL"),
+                    Some(values) => {
+                        if values.is_empty() {
+                            buf.write_str("'{}'")?;
+                        } else {
+                            // TODO: refactor this with JoinWrite after #1055 merged
+                            // TODO: refactor this if deref_pattern is stabilize
+                            macro_rules! validate_value {
+                                ($name:ident) => {
+                                    {
+                                        let Value::Enum(OptionEnum::Some(value)) = $name else {
+                                            panic!(
+                                                "Value::Array(ArrayType::Enum) should contain Value::Enum"
+                                            );
+                                        };
+                                        self.write_string_quoted(value.value.as_ref(), buf);
+                                    }
+                                };
+                            }
+                            buf.write_str("ARRAY [")?;
+                            let mut iter = values.iter();
+                            if let Some(element) = iter.next() {
+                                validate_value!(element);
+                                for element in iter {
+                                    buf.write_str(",")?;
+                                    validate_value!(element)
+                                }
+                            }
+                            buf.write_str("]")?;
+                        }
+                    }
+                }
+                self.write_enum_type_hint(type_name.as_ref(), buf);
+                Ok(())
+            }
+            _ => self.write_value_common(buf, value),
+        }
+    }
+
     fn prepare_select_distinct(&self, select_distinct: &SelectDistinct, sql: &mut impl SqlWriter) {
         match select_distinct {
             SelectDistinct::All => sql.write_str("ALL").unwrap(),
@@ -89,8 +143,8 @@ impl QueryBuilder for PostgresQueryBuilder {
             sql.write_fmt(format_args!("{modifier} ")).unwrap();
         }
 
-        sql.write_fmt(format_args!(r#"TABLE "{}""#, into_table.target_table))
-            .unwrap();
+        sql.write_str("TABLE ").unwrap();
+        self.prepare_iden(&into_table.target_table, sql);
     }
 
     fn prepare_bin_oper(&self, bin_oper: &BinOper, sql: &mut impl SqlWriter) {
@@ -130,6 +184,122 @@ impl QueryBuilder for PostgresQueryBuilder {
         query.prepare_statement(self, sql);
     }
 
+    fn prepare_explain_statement(&self, explain: &ExplainStatement, sql: &mut impl SqlWriter) {
+        fn write_sep(sql: &mut impl SqlWriter, first: &mut bool) {
+            if !*first {
+                sql.write_str(", ").unwrap();
+            } else {
+                *first = false;
+            }
+        }
+
+        // https://www.postgresql.org/docs/current/sql-explain.html
+        // Specifies whether the selected option should be turned on or off. You can write TRUE, ON, or 1 to enable the option, and FALSE, OFF, or 0 to disable it. The boolean value can also be omitted, in which case TRUE is assumed.
+        fn write_false(sql: &mut impl SqlWriter, value: bool) {
+            if !value {
+                sql.write_str(" 0").unwrap();
+            }
+        }
+
+        sql.write_str("EXPLAIN").unwrap();
+
+        let has_options = explain.analyze.is_some()
+            || explain.pg_opts.verbose.is_some()
+            || explain.pg_opts.costs.is_some()
+            || explain.pg_opts.settings.is_some()
+            || explain.pg_opts.generic_plan.is_some()
+            || explain.pg_opts.buffers.is_some()
+            || explain.pg_opts.serialize.is_some()
+            || explain.pg_opts.wal.is_some()
+            || explain.pg_opts.timing.is_some()
+            || explain.pg_opts.summary.is_some()
+            || explain.pg_opts.memory.is_some()
+            || explain.format.is_some();
+
+        if has_options {
+            sql.write_str(" (").unwrap();
+            let mut first = true;
+
+            if let Some(analyze) = explain.analyze {
+                write_sep(sql, &mut first);
+                sql.write_str("ANALYZE").unwrap();
+                write_false(sql, analyze);
+            }
+
+            if let Some(verbose) = explain.pg_opts.verbose {
+                write_sep(sql, &mut first);
+                sql.write_str("VERBOSE").unwrap();
+                write_false(sql, verbose);
+            }
+
+            if let Some(costs) = explain.pg_opts.costs {
+                write_sep(sql, &mut first);
+                sql.write_str("COSTS").unwrap();
+                write_false(sql, costs);
+            }
+
+            if let Some(settings) = explain.pg_opts.settings {
+                write_sep(sql, &mut first);
+                sql.write_str("SETTINGS").unwrap();
+                write_false(sql, settings);
+            }
+
+            if let Some(generic_plan) = explain.pg_opts.generic_plan {
+                write_sep(sql, &mut first);
+                sql.write_str("GENERIC_PLAN").unwrap();
+                write_false(sql, generic_plan);
+            }
+
+            if let Some(buffers) = explain.pg_opts.buffers {
+                write_sep(sql, &mut first);
+                sql.write_str("BUFFERS").unwrap();
+                write_false(sql, buffers);
+            }
+
+            if let Some(serialize) = explain.pg_opts.serialize {
+                write_sep(sql, &mut first);
+                sql.write_str("SERIALIZE ").unwrap();
+                sql.write_str(serialize.as_str()).unwrap();
+            }
+
+            if let Some(wal) = explain.pg_opts.wal {
+                write_sep(sql, &mut first);
+                sql.write_str("WAL").unwrap();
+                write_false(sql, wal);
+            }
+
+            if let Some(timing) = explain.pg_opts.timing {
+                write_sep(sql, &mut first);
+                sql.write_str("TIMING").unwrap();
+                write_false(sql, timing);
+            }
+
+            if let Some(summary) = explain.pg_opts.summary {
+                write_sep(sql, &mut first);
+                sql.write_str("SUMMARY").unwrap();
+                write_false(sql, summary);
+            }
+
+            if let Some(memory) = explain.pg_opts.memory {
+                write_sep(sql, &mut first);
+                sql.write_str("MEMORY").unwrap();
+                write_false(sql, memory);
+            }
+
+            if let Some(format) = explain.format {
+                write_sep(sql, &mut first);
+                sql.write_str("FORMAT ").unwrap();
+                sql.write_str(format.as_str()).unwrap();
+            }
+            sql.write_str(")").unwrap();
+        }
+
+        if let Some(statement) = &explain.statement {
+            sql.write_str(" ").unwrap();
+            statement.write_to(self, sql);
+        }
+    }
+
     fn prepare_function_name(&self, function: &Func, sql: &mut impl SqlWriter) {
         match function {
             Func::PgFunction(function) => sql
@@ -150,6 +320,17 @@ impl QueryBuilder for PostgresQueryBuilder {
                     PgFunc::Any => "ANY",
                     PgFunc::Some => "SOME",
                     PgFunc::All => "ALL",
+                    PgFunc::AdvisoryLock => "PG_ADVISORY_LOCK",
+                    PgFunc::AdvisoryLockShared => "PG_ADVISORY_LOCK_SHARED",
+                    PgFunc::TryAdvisoryLock => "PG_TRY_ADVISORY_LOCK",
+                    PgFunc::TryAdvisoryLockShared => "PG_TRY_ADVISORY_LOCK_SHARED",
+                    PgFunc::AdvisoryUnlock => "PG_ADVISORY_UNLOCK",
+                    PgFunc::AdvisoryUnlockShared => "PG_ADVISORY_UNLOCK_SHARED",
+                    PgFunc::AdvisoryUnlockAll => "PG_ADVISORY_UNLOCK_ALL",
+                    PgFunc::AdvisoryXactLock => "PG_ADVISORY_XACT_LOCK",
+                    PgFunc::AdvisoryXactLockShared => "PG_ADVISORY_XACT_LOCK_SHARED",
+                    PgFunc::TryAdvisoryXactLock => "PG_TRY_ADVISORY_XACT_LOCK",
+                    PgFunc::TryAdvisoryXactLockShared => "PG_TRY_ADVISORY_XACT_LOCK_SHARED",
                 })
                 .unwrap(),
             _ => self.prepare_function_name_common(function, sql),
@@ -188,7 +369,43 @@ impl QueryBuilder for PostgresQueryBuilder {
     }
 
     fn prepare_value(&self, value: Value, sql: &mut impl SqlWriter) {
-        sql.push_param(value, self as _);
+        match value {
+            Value::Enum(value) => match value {
+                OptionEnum::Some(value) => {
+                    let Enum { type_name, value } = *value;
+                    sql.push_param(Value::String(Some(value.into_owned())), self as _);
+                    self.write_enum_type_hint(type_name, sql);
+                }
+                OptionEnum::None(type_name) => {
+                    sql.push_param(Value::String(None), self as _);
+                    self.write_enum_type_hint(type_name, sql);
+                }
+            },
+            #[cfg(feature = "postgres-array")]
+            Value::Array(ArrayType::Enum(type_name), values) => {
+                let values = values.map(|values| {
+                    Box::new(
+                        values
+                            .into_iter()
+                            .map(|value| match value {
+                                Value::Enum(OptionEnum::Some(value)) => {
+                                    Value::String(Some(value.value.into_owned()))
+                                }
+                                _ => {
+                                    panic!(
+                                        "Value::Array(ArrayType::Enum) should contain Value::Enum"
+                                    );
+                                }
+                            })
+                            .collect(),
+                    )
+                });
+                sql.push_param(Value::Array(ArrayType::String, values), self as _);
+                self.write_enum_type_hint(type_name.as_ref(), sql);
+                sql.write_str("[]").unwrap();
+            }
+            _ => sql.push_param(value, self as _),
+        }
     }
 
     fn write_string_quoted(&self, string: &str, buffer: &mut impl Write) {
@@ -211,6 +428,16 @@ impl QueryBuilder for PostgresQueryBuilder {
 
     fn if_null_function(&self) -> &str {
         "COALESCE"
+    }
+}
+
+impl PostgresQueryBuilder {
+    fn write_enum_type_hint(&self, type_name: impl AsRef<str>, sql: &mut impl Write) {
+        sql.write_str("::").unwrap();
+        let q = self.quote();
+        sql.write_char(q.left()).unwrap();
+        sql.write_str(type_name.as_ref()).unwrap();
+        sql.write_char(q.right()).unwrap();
     }
 }
 
